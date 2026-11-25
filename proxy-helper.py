@@ -302,10 +302,149 @@ def run_job(job):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+# ───────────────────────── Cloudflare R2 (client review copies) ─────────────────────────
+# Client links stream from R2 instead of public Drive files (Drive throttles public
+# downloads). Keys live only on this Mac in ~/.cutroom/r2.json (chmod 600), entered
+# with:  python3 proxy-helper.py --setup-r2
+import hashlib
+import hmac
+import http.client
+import secrets
+from datetime import datetime, timezone
+
+R2_CONFIG = os.path.expanduser("~/.cutroom/r2.json")
+
+
+def load_r2():
+    try:
+        with open(R2_CONFIG) as f:
+            c = json.load(f)
+        if all(c.get(k) for k in ("accountId", "bucket", "accessKeyId", "secretAccessKey", "publicBase")):
+            return c
+    except Exception:
+        pass
+    return None
+
+
+def _sign(key, msg):
+    return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+
+def r2_request(method, key, body=None, length=0, content_type=None):
+    """One S3-compatible request to R2, signed with AWS SigV4 (UNSIGNED-PAYLOAD)."""
+    c = load_r2()
+    if not c:
+        raise RuntimeError("Cloudflare R2 isn't set up. Run: python3 proxy-helper.py --setup-r2")
+    host = f"{c['accountId']}.r2.cloudflarestorage.com"
+    path = "/" + urllib.parse.quote(c["bucket"]) + "/" + urllib.parse.quote(key, safe="/")
+    now = datetime.now(timezone.utc)
+    amz_date, day = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+    headers = {"host": host, "x-amz-content-sha256": "UNSIGNED-PAYLOAD", "x-amz-date": amz_date}
+    signed = ";".join(sorted(headers))
+    canonical = "\n".join([method, path, "", "".join(f"{k}:{headers[k]}\n" for k in sorted(headers)), signed, "UNSIGNED-PAYLOAD"])
+    scope = f"{day}/auto/s3/aws4_request"
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    k = _sign(_sign(_sign(_sign(("AWS4" + c["secretAccessKey"]).encode(), day), "auto"), "s3"), "aws4_request")
+    sig = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
+    headers["Authorization"] = f"AWS4-HMAC-SHA256 Credential={c['accessKeyId']}/{scope}, SignedHeaders={signed}, Signature={sig}"
+    if content_type:
+        headers["Content-Type"] = content_type
+    if body is not None:
+        headers["Content-Length"] = str(length)
+    conn = http.client.HTTPSConnection(host, timeout=600)
+    try:
+        conn.request(method, path, body=body, headers=headers)
+        res = conn.getresponse()
+        text = res.read().decode(errors="replace")
+        if res.status >= 300:
+            raise RuntimeError(f"Cloudflare R2 said {res.status}: {text[:200]}")
+    finally:
+        conn.close()
+    return c["publicBase"].rstrip("/") + "/" + urllib.parse.quote(key, safe="/")
+
+
+class _Progress:
+    """File wrapper so uploads report progress."""
+    def __init__(self, f, size, cb):
+        self.f, self.size, self.sent, self.cb = f, size, 0, cb
+    def read(self, n=-1):
+        chunk = self.f.read(1024 * 1024 if n is None or n < 0 else n)
+        self.sent += len(chunk)
+        self.cb(self.sent / self.size if self.size else 1)
+        return chunk
+
+
+def run_publish(job):
+    """Copy a Drive file (usually the proxy) to R2 under an unguessable path."""
+    jid = job["id"]
+    tmp = tempfile.mkdtemp(prefix="cutroom-pub-")
+    try:
+        while True:
+            try:
+                src = os.path.join(tmp, "video.mp4")
+                S.update(jid, state="downloading", progress=0)
+                download(jid, job["fileId"], job.get("size"), src)
+                size = os.path.getsize(src)
+                safe = re.sub(r"[^A-Za-z0-9._-]+", "-", os.path.splitext(job["name"])[0]).strip("-")[:80] or "video"
+                key = f"v/{secrets.token_urlsafe(18)}/{safe}.mp4"
+                S.update(jid, state="publishing", progress=0, detail="")
+                last = [0]
+                def cb(p):
+                    if time.time() - last[0] > 0.4:
+                        last[0] = time.time()
+                        S.update(jid, progress=p, detail=f"{p * size / 1e6:.0f} of {size / 1e6:.0f} MB")
+                with open(src, "rb") as f:
+                    url = r2_request("PUT", key, body=_Progress(f, size, cb), length=size, content_type="video/mp4")
+                S.update(jid, state="done", progress=1, detail="", url=url)
+                return
+            except AuthExpired:
+                S.update(jid, state="waiting", detail="Waiting for Cutroom to refresh your Google sign-in")
+                S.token_event.wait()
+    except Exception as e:
+        S.update(jid, state="error", detail=str(e))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def setup_r2():
+    import getpass
+    print("Cutroom — Cloudflare R2 setup (keys stay on this Mac in ~/.cutroom/r2.json)\n")
+    old = load_r2() or {}
+    def ask(label, keyname, hidden=False):
+        cur = old.get(keyname, "")
+        hint = " [keep current]" if cur else ""
+        v = (getpass.getpass if hidden else input)(f"{label}{hint}: ").strip()
+        return v or cur
+    c = {
+        "accountId": ask("Cloudflare account ID", "accountId"),
+        "bucket": ask("R2 bucket name", "bucket"),
+        "publicBase": ask("Public bucket URL (https://pub-….r2.dev)", "publicBase").rstrip("/"),
+        "accessKeyId": ask("R2 Access Key ID", "accessKeyId"),
+        "secretAccessKey": ask("R2 Secret Access Key (hidden)", "secretAccessKey", hidden=True),
+    }
+    os.makedirs(os.path.dirname(R2_CONFIG), exist_ok=True)
+    with open(R2_CONFIG, "w") as f:
+        json.dump(c, f)
+    os.chmod(R2_CONFIG, 0o600)
+    print("\nTesting: uploading and deleting a tiny file…")
+    try:
+        import io
+        data = b"cutroom-test"
+        url = r2_request("PUT", "cutroom-setup-test.txt", body=io.BytesIO(data), length=len(data), content_type="text/plain")
+        pub = urllib.request.urlopen(url, timeout=30).read()
+        r2_request("DELETE", "cutroom-setup-test.txt")
+        print("Upload: OK   Public read: " + ("OK" if pub == data else "unexpected content"))
+        print("All set. Start the helper normally:  python3 proxy-helper.py")
+    except Exception as e:
+        print("Test failed:", e)
+        print("Check the values and run --setup-r2 again.")
+
+
 def worker():
     while True:
         job = S.q.get()
-        run_job(job)
+        (run_publish if job.get("kind") == "publish" else run_job)(job)
         S.q.task_done()
 
 
@@ -354,7 +493,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.origin_ok():
             return self.reply(403, {"error": "This helper only talks to the Cutroom site."})
         if self.path == "/health":
-            return self.reply(200, {"ok": True, "version": 1, "encoder": ENCODER, "ffmpeg": bool(FFMPEG and FFPROBE)})
+            return self.reply(200, {"ok": True, "version": 1, "encoder": ENCODER, "ffmpeg": bool(FFMPEG and FFPROBE), "r2": bool(load_r2())})
         if self.path == "/status":
             return self.reply(200, {"jobs": S.snapshot(), "hasToken": bool(S.get_token())})
         self.reply(404, {"error": "Not found"})
@@ -389,6 +528,34 @@ class Handler(BaseHTTPRequestHandler):
                 S.q.put(dict(job))
                 created.append(jid)
             return self.reply(200, {"created": created})
+        if self.path == "/publish":
+            if not load_r2():
+                return self.reply(400, {"error": "Cloudflare R2 isn't set up on this Mac. Run: python3 proxy-helper.py --setup-r2"})
+            created = []
+            for f in data.get("files", []):
+                if not re.fullmatch(r"[\w-]{10,}", str(f.get("id", ""))):
+                    continue
+                jid = uuid.uuid4().hex[:10]
+                job = {"id": jid, "kind": "publish", "fileId": f["id"], "name": str(f.get("name") or f["id"])[:200], "size": f.get("size"),
+                       "folderId": str(data.get("folderId", ""))[:80], "state": "queued", "progress": 0, "detail": "", "url": None, "createdAt": time.time()}
+                with S.lock:
+                    S.jobs[jid] = job
+                    S.order.append(jid)
+                S.q.put(dict(job))
+                created.append({"jobId": jid, "fileId": f["id"]})
+            return self.reply(200, {"created": created})
+        if self.path == "/unpublish":
+            c = load_r2()
+            urls = [u for u in data.get("urls", []) if isinstance(u, str)]
+            removed = 0
+            for u in urls:
+                if c and u.startswith(c["publicBase"].rstrip("/") + "/v/"):
+                    try:
+                        r2_request("DELETE", urllib.parse.unquote(u[len(c["publicBase"].rstrip("/")) + 1:]))
+                        removed += 1
+                    except Exception:
+                        pass
+            return self.reply(200, {"removed": removed})
         if self.path == "/clear":
             with S.lock:
                 S.order = [j for j in S.order if S.jobs[j]["state"] not in ("done", "skipped", "error")]
@@ -404,6 +571,7 @@ def main():
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Cutroom proxy helper is running on http://127.0.0.1:{PORT}  (encoder: {ENCODER})")
     print("Leave this window open, then click \"Make proxies\" in Cutroom. Press Ctrl+C to stop.")
+    print("Cloudflare R2 for client links: " + ("ready" if load_r2() else "not set up (python3 proxy-helper.py --setup-r2)"))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -411,4 +579,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--setup-r2" in sys.argv:
+        setup_r2()
+    else:
+        main()

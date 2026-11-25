@@ -237,7 +237,7 @@ function render() {
   });
   video.addEventListener('error', () => {
     if (!video.getAttribute('src')) return;
-    showMsg([h('p', { class: 'error' }, 'The video couldn’t be loaded.'), h('p', { class: 'faint small' }, 'Check your connection and try again. If it keeps happening, let the sender know.'), h('button', { class: 'btn', onclick: loadVideo }, 'Retry')]);
+    showMsg([h('p', { class: 'error' }, 'The video couldn’t be loaded.'), h('p', { class: 'faint small' }, 'Google Drive may be limiting downloads of this file. Wait a minute and press Retry. If it keeps happening, let the sender know.'), h('button', { class: 'btn', onclick: loadVideo }, 'Retry')]);
   });
   video.addEventListener('play', () => { playBtn.replaceChildren(icon('pause')); S.selected = null; markSelected(); renderInk(); tick(); });
   video.addEventListener('pause', () => { playBtn.replaceChildren(icon('play')); updateTime(); renderInk(); });
@@ -295,12 +295,131 @@ function render() {
 }
 
 function showMsg(content) { stageMsg.replaceChildren(...[content].flat().filter(Boolean)); stageMsg.classList.remove('hidden'); }
-function loadVideo() {
+// Google throttles public Drive downloads (403 downloadQuotaExceeded) and a
+// seeking video player makes dozens of range requests, so: files up to
+// FULL_LOAD_MAX are fetched once (resuming after refusals) and played from
+// memory; bigger files stream through sw.js, which retries refused requests.
+const FULL_LOAD_MAX = 700 * 1024 * 1024;
+let swReady = null;
+function setupSW() {
+  if (swReady) return swReady;
+  swReady = (async () => {
+    if (!('serviceWorker' in navigator) || !window.isSecureContext) return false;
+    try {
+      await navigator.serviceWorker.register('./sw.js');
+      await navigator.serviceWorker.ready;
+      if (!navigator.serviceWorker.controller) await new Promise((r) => { navigator.serviceWorker.addEventListener('controllerchange', r, { once: true }); setTimeout(r, 3000); });
+      return !!navigator.serviceWorker.controller;
+    } catch { return false; }
+  })();
+  return swReady;
+}
+const blobCache = new Map(); // fileId -> object URL
+let loadSeq = 0;
+
+async function fileSize(fileId) {
+  for (let i = 0; i < 4; i++) {
+    try {
+      const r = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=size&supportsAllDrives=true&key=${encodeURIComponent(CFG.apiKey)}`);
+      if (r.ok) return Number((await r.json()).size) || 0;
+    } catch { /* retry */ }
+    await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+  }
+  return 0;
+}
+
+async function fetchWhole(fileId, size, onProgress, isCurrent) {
+  const parts = [];
+  let got = 0, fails = 0;
+  while (got < size) {
+    if (!isCurrent()) throw new Error('cancelled');
+    let r;
+    try { r = await fetch(videoUrl(fileId), { headers: { Range: `bytes=${got}-` } }); } catch { r = null; }
+    if (!r || (r.status !== 206 && r.status !== 200)) {
+      if (++fails > 12) throw new Error(r ? `Google refused the download (${r.status})` : 'Network error');
+      onProgress(got / size, true);
+      await new Promise((res) => setTimeout(res, Math.min(10000, 500 * 2 ** Math.min(fails, 5))));
+      continue;
+    }
+    fails = 0;
+    if (r.status === 200 && got > 0) { parts.length = 0; got = 0; } // server ignored Range: start over
+    const reader = r.body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value); got += value.length; onProgress(got / size, false);
+        if (!isCurrent()) { reader.cancel(); throw new Error('cancelled'); }
+      }
+    } catch (e) { if (e.message === 'cancelled') throw e; /* dropped mid-stream: resume from `got` */ }
+  }
+  return URL.createObjectURL(new Blob(parts, { type: 'video/mp4' }));
+}
+
+// Videos come through your Google script (the "relay"): it reads the file with
+// the owner's own access and hands out ~6 MB pieces, so Drive's public-download
+// limits never apply. Pieces load 4 at a time, then play from memory (instant seeking).
+const RELAY_CHUNK = 6 * 1024 * 1024;
+async function relayPiece(versionId, start) {
+  let wait = 600;
+  for (let attempt = 0; attempt < 7; attempt++) {
+    let j;
+    try {
+      const r = await fetch(`${CFG.linksEndpoint}?action=chunk&token=${encodeURIComponent(token)}&v=${encodeURIComponent(versionId)}&start=${start}&len=${RELAY_CHUNK}`);
+      j = await r.json();
+    } catch { j = { error: 'network' }; }
+    if (!j.error) {
+      const bytes = j.data ? new Uint8Array(await (await fetch('data:application/octet-stream;base64,' + j.data)).arrayBuffer()) : new Uint8Array(0);
+      return { total: j.total, bytes };
+    }
+    if (/turned off|doesn’t exist|Unknown version/.test(j.error)) { const e = new Error(j.error); e.fatal = true; throw e; }
+    await new Promise((r) => setTimeout(r, wait + Math.random() * 300)); wait = Math.min(8000, wait * 2);
+  }
+  throw new Error('The video service is busy');
+}
+async function loadViaRelay(v, onProgress, isCurrent) {
+  const first = await relayPiece(v.id, 0);
+  const total = first.total, n = Math.max(1, Math.ceil(total / RELAY_CHUNK));
+  const parts = new Array(n); parts[0] = first.bytes;
+  let done = 1, next = 1;
+  onProgress(done / n, total);
+  const worker = async () => {
+    while (next < n) {
+      const i = next++;
+      if (!isCurrent()) throw new Error('cancelled');
+      parts[i] = (await relayPiece(v.id, i * RELAY_CHUNK)).bytes;
+      done++; onProgress(done / n, total);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, n - 1) }, worker));
+  return URL.createObjectURL(new Blob(parts, { type: 'video/mp4' }));
+}
+
+async function loadVideo() {
   video.pause(); S.selected = null; S.strokes = []; S.pinT = null; setTool(null);
-  showMsg([h('div', { class: 'spinner' }), h('p', {}, 'Loading video…')]);
-  video.src = videoUrl(curV().fileId); video.load();
   renderComments(); renderMarkers();
   const sel = $('.rv-head select'); if (sel) sel.value = S.vIdx;
+  const my = ++loadSeq, isCurrent = () => my === loadSeq;
+  const v = curV();
+  const bar = h('div', { class: 'bar' }, h('div', { style: { width: '0%' } }));
+  const label = h('p', {}, 'Loading video…');
+  showMsg([h('div', { class: 'spinner' }), label]);
+  try {
+    if (v.url) { video.src = v.url; video.load(); return; } // optional external copy (e.g. Cloudflare R2)
+    if (blobCache.has(v.id)) { video.src = blobCache.get(v.id); video.load(); return; }
+    showMsg([label, h('div', { class: 'proxy-wait' }, bar), h('p', { class: 'faint small' }, 'The whole video loads first, then playback and frame-stepping are instant.')]);
+    const url = await loadViaRelay(v, (p, total) => {
+      bar.firstChild.style.width = Math.round(p * 100) + '%';
+      label.textContent = `Loading video ${Math.round(p * 100)}% · ${(total / 1e6).toFixed(0)} MB`;
+    }, isCurrent);
+    if (!isCurrent()) return;
+    blobCache.set(v.id, url);
+    video.src = url;
+    video.load();
+  } catch (e) {
+    if (e.message === 'cancelled' || !isCurrent()) return;
+    showMsg([h('p', { class: 'error' }, 'The video couldn’t be loaded.'), h('p', { class: 'faint small' }, e.fatal ? e.message : 'The video service is busy right now. Wait a moment and try again.'), e.fatal ? null : h('button', { class: 'btn', onclick: loadVideo }, 'Retry')]);
+  }
 }
 
 const togglePlay = () => { if (video.paused) video.play().catch(() => {}); else video.pause(); };

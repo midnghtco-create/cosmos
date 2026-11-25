@@ -38,10 +38,32 @@ async function freshToken() {
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (url.origin !== self.location.origin) return;
+  const pub = url.pathname.match(/\/__public\/([\w-]+)$/);
+  if (pub) { e.respondWith(publicStream(pub[1], url.searchParams.get('key'), e.request)); return; }
   const m = url.pathname.match(/\/__drive\/([\w-]+)$/);
   if (!m) return;
   e.respondWith(stream(m[1], e.request));
 });
+
+// Client review links: a shared (anyone-with-link) file streamed with the site's
+// read-only API key. Google throttles public downloads and randomly refuses
+// requests with 403 downloadQuotaExceeded / 429; a video element gives up on
+// the first refusal, so retry here with backoff and the player never sees it.
+async function publicStream(fileId, key, req) {
+  const target = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true&key=${encodeURIComponent(key || '')}`;
+  const headers = {};
+  const range = req.headers.get('range');
+  if (range) headers.Range = range;
+  let res;
+  for (let attempt = 0; attempt < 7; attempt++) {
+    try {
+      res = await fetch(target, { headers });
+      if (![403, 429, 500, 502, 503, 504].includes(res.status)) return res;
+    } catch (err) { /* network blip: retry */ }
+    await new Promise((r) => setTimeout(r, Math.min(8000, 400 * 2 ** attempt) + Math.random() * 300));
+  }
+  return res || new Response('Video unavailable', { status: 503 });
+}
 
 async function stream(fileId, req) {
   const target = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`;

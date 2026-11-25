@@ -908,7 +908,7 @@ async function helperCall(path, body) {
 
 const JOB_LABELS = {
   queued: 'Waiting', checking: 'Checking', downloading: 'Downloading original', encoding: 'Converting',
-  uploading: 'Uploading proxy', done: 'Done', skipped: 'Already has a proxy', error: 'Failed', waiting: 'Needs sign-in',
+  uploading: 'Uploading proxy', publishing: 'Uploading to Cloudflare', done: 'Done', skipped: 'Already has a proxy', error: 'Failed', waiting: 'Needs sign-in',
 };
 
 function proxyModal(p, files, onlyId, onFinished) {
@@ -1021,6 +1021,7 @@ function proxyModal(p, files, onlyId, onFinished) {
 // web app in the owner's account (apps-script/Code.gs). This side publishes the
 // video and your notes, and merges client comments and replies back in.
 const PUB = window.CUTROOM_PUBLIC || {};
+const R2_ON = PUB.r2 === true; // optional: client copies on Cloudflare R2 (see proxy-helper.py --setup-r2)
 const linksReady = () => !!(PUB.linksEndpoint && !PUB.linksEndpoint.startsWith('__') && Store.data.links?.ownerKey);
 function newToken() {
   const b = crypto.getRandomValues(new Uint8Array(18));
@@ -1052,7 +1053,7 @@ async function syncShare(p, asset) {
   }
   const res = await linksCall({
     action: 'sync', token: share.token, title: asset.name, project: p.name, status: asset.status, allowDraw: share.allowDraw !== false,
-    versions: versions.map((v) => ({ id: v.id, label: v.name, fileId: proxies.get(v.fileId)?.id || v.fileId, fps: asset.fps || settings.fps || 24 })),
+    versions: versions.map((v) => { const fid = proxies.get(v.fileId)?.id || v.fileId; return { id: v.id, label: v.name, fileId: fid, url: asset.r2?.[fid]?.url || '', fps: asset.fps || settings.fps || 24 }; }),
     owner: {
       comments: mine.map((c) => ({ id: c.id, versionId: c.versionId, t: c.t, text: c.text, drawing: c.drawing, author: c.author, createdAt: c.createdAt })),
       replies,
@@ -1087,6 +1088,37 @@ function mergeShareThread(asset, thread) {
   }
 }
 
+// Copy each shared version's playable file (the proxy when there is one) to
+// Cloudflare R2 through the local helper, so clients stream without Drive limits.
+function shareTargets(p, asset, proxies) {
+  const versions = (asset.share?.scope === 'latest' ? asset.versions.slice(-1) : asset.versions).filter((v) => v.fileId);
+  return versions.map((v) => { const px = proxies.get(v.fileId); return { id: px?.id || v.fileId, name: px?.name || v.name, size: px?.size, proxied: !!px }; });
+}
+async function publishCopies(p, asset, onStatus) {
+  const proxies = await loadProxies(p);
+  asset.r2 = asset.r2 || {};
+  const todo = shareTargets(p, asset, proxies).filter((x) => !asset.r2[x.id]);
+  if (!todo.length) return 0;
+  const health = await helperCall('/health');
+  if (!health.r2) throw new Error('Cloudflare isn’t set up in the helper yet (python3 proxy-helper.py --setup-r2)');
+  const res = await helperCall('/publish', { token: await Drive.getToken(), folderId: p.folderId, files: todo.map((x) => ({ id: x.id, name: x.name, size: x.size })) });
+  const ids = new Set(res.created.map((c) => c.jobId));
+  for (;;) {
+    const st = await helperCall('/status');
+    const jobs = st.jobs.filter((j) => ids.has(j.id));
+    onStatus?.(jobs.map((j) => `${j.name}: ${JOB_LABELS[j.state] || j.state}${j.progress && j.state !== 'done' ? ' ' + Math.round(j.progress * 100) + '%' : ''}`).join(' · '));
+    if (jobs.some((j) => j.state === 'waiting')) helperCall('/token', { token: await Drive.getToken() }).catch(() => {});
+    if (jobs.every((j) => j.state === 'done' || j.state === 'error')) {
+      for (const j of jobs) if (j.state === 'done' && j.url) asset.r2[j.fileId] = { url: j.url, at: Date.now() };
+      Store.save({ quiet: true });
+      const bad = jobs.find((j) => j.state === 'error');
+      if (bad) throw new Error(bad.detail);
+      return jobs.length;
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+}
+
 function shareModal(p, asset, onChange) {
   const body = h('div');
   const foot = h('div', { class: 'row gap grow end' });
@@ -1108,6 +1140,23 @@ function shareModal(p, asset, onChange) {
       } }, 'Save key'));
   }
 
+  function copyRow() {
+    const targets = shareTargets(p, asset, proxyCache.get(p.id) || new Map());
+    const done = targets.filter((x) => asset.r2?.[x.id]).length;
+    const status = h('span', { class: 'faint small' });
+    const btn = h('button', { class: 'btn sm', onclick: async () => {
+      btn.disabled = true;
+      try { const n = await publishCopies(p, asset, (t) => { status.textContent = t; }); await syncShare(p, asset); toast(n ? 'Client copies are on Cloudflare' : 'Already up to date'); show(); onChange?.(); }
+      catch (e) { btn.disabled = false; status.textContent = ''; toast(e.message.includes('fetch') ? 'Start the proxy helper on your Mac first' : e.message); }
+    } }, icon('upload'), done < targets.length ? 'Upload client copies to Cloudflare' : 'Re-check');
+    return h('div', { class: 'field' }, h('span', {}, 'Client playback'),
+      h('p', { class: 'muted small' }, done === targets.length && targets.length
+        ? `All ${targets.length} version${targets.length === 1 ? '' : 's'} stream from Cloudflare: fast, no Drive limits.`
+        : `${done} of ${targets.length} versions are on Cloudflare. The rest stream from Drive, which Google may throttle. Needs the proxy helper running.`),
+      targets.some((x) => !x.proxied) ? h('p', { class: 'warn small' }, 'Some versions have no proxy, so the full original would be uploaded. Make proxies first for smaller, faster copies.') : null,
+      h('div', { class: 'row gap' }, btn, status));
+  }
+
   function show() {
     if (!linksReady()) return setup();
     const s = asset.share;
@@ -1119,11 +1168,16 @@ function shareModal(p, asset, onChange) {
         h('p', {}, 'Anyone with this link can watch this video and add comments, drawings and replies. They can’t see your other videos, edit, resolve or delete anything.'),
         h('div', { class: 'share-url' }, input, h('button', { class: 'btn primary', onclick: async () => { try { await navigator.clipboard.writeText(url); toast('Link copied'); } catch { input.select(); toast('Press ⌘C to copy'); } } }, icon('copy'), 'Copy')),
         h('p', { class: 'muted small' }, `${counts} client comment${counts === 1 ? '' : 's'} so far · shares ${s.scope === 'latest' ? 'the latest version only' : 'all versions'}${s.allowDraw === false ? ' · drawing off' : ''} · last synced ${s.syncedAt ? timeAgo(s.syncedAt) : 'never'}`),
-        h('p', { class: 'faint small' }, 'The video file is set to “anyone with the link can view” in Drive so the client can stream it (the proxy when there is one). Turning the link off restores the previous Drive sharing.'));
+        R2_ON ? copyRow() : h('p', { class: 'faint small' }, 'Clients load the video through your Google script with your own access, so nothing is made public in Drive. Tip: share proxies; they load much faster than originals.'));
       foot.replaceChildren(
         h('button', { class: 'btn ghost', onclick: async () => {
           if (!confirm('Turn this link off? The client will no longer be able to open it. Their comments stay in your review.')) return;
-          try { await linksCall({ action: 'revoke', token: s.token }); s.revoked = true; Store.save({ quiet: true }); toast('Link turned off'); show(); onChange?.(); }
+          try {
+            await linksCall({ action: 'revoke', token: s.token }); s.revoked = true;
+            const urls = Object.values(asset.r2 || {}).map((x) => x.url);
+            if (urls.length) { try { await helperCall('/unpublish', { urls }); asset.r2 = {}; } catch { toast('Link off. Start the helper to also delete the Cloudflare copies.'); } }
+            Store.save({ quiet: true }); toast('Link turned off'); show(); onChange?.();
+          }
           catch (e) { toast('Couldn’t turn it off: ' + e.message); }
         } }, 'Turn link off'),
         h('div', { class: 'grow' }),
@@ -1142,7 +1196,12 @@ function shareModal(p, asset, onChange) {
       h('button', { class: 'btn primary', onclick: async (e) => {
         e.currentTarget.disabled = true; e.currentTarget.textContent = 'Creating…';
         asset.share = { token: newToken(), createdAt: Date.now(), scope: scope.value, allowDraw: draw.checked, hidden: [] };
-        try { await syncShare(p, asset); Store.save({ quiet: true }); show(); onChange?.(); }
+        const btn = e.currentTarget;
+        try {
+          if (R2_ON) try { await publishCopies(p, asset, (t) => { btn.textContent = t.slice(0, 60) || 'Uploading…'; }); }
+          catch (err) { toast('Link created, but client copies weren’t uploaded: ' + (err.message.includes('fetch') ? 'the proxy helper isn’t running' : err.message)); }
+          await syncShare(p, asset); Store.save({ quiet: true }); show(); onChange?.();
+        }
         catch (err) { delete asset.share; toast('Couldn’t create the link: ' + err.message); show(); }
       } }, icon('share'), 'Create link'));
   }
