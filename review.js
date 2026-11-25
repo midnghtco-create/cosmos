@@ -45,6 +45,32 @@ const ICONS = {
   user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
 };
 const icon = (n) => h('span', { class: 'ic', 'aria-hidden': 'true', html: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[n] || ''}</svg>` });
+// ── theme: system → light → dark ──
+const THEME_ICONS = {
+  system: '<rect x="3" y="4" width="18" height="12" rx="1"/><path d="M8 20h8M12 16v4"/>',
+  light: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  dark: '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>',
+};
+function currentTheme() { try { const t = localStorage.getItem('cutroom:theme'); return t === 'light' || t === 'dark' ? t : 'system'; } catch { return 'system'; } }
+function applyTheme(t) {
+  if (t === 'system') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t);
+  try { if (t === 'system') localStorage.removeItem('cutroom:theme'); else localStorage.setItem('cutroom:theme', t); } catch { /* ignore */ }
+}
+function themeButton() {
+  const label = { system: 'Theme: follows your system', light: 'Theme: light', dark: 'Theme: dark' };
+  const b = document.createElement('button');
+  b.className = 'icon-btn theme-btn';
+  const paint = () => {
+    const t = currentTheme();
+    b.title = label[t] + ' (click to change)';
+    b.setAttribute('aria-label', label[t]);
+    b.innerHTML = `<span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${THEME_ICONS[t]}</svg></span>`;
+  };
+  b.addEventListener('click', () => { const order = ['system', 'light', 'dark']; applyTheme(order[(order.indexOf(currentTheme()) + 1) % 3]); paint(); });
+  paint();
+  return b;
+}
+
 const INK_COLORS = ['#ff4d5e', '#ffd43b', '#3ee08f', '#4dabff', '#ffffff'];
 function fmtTC(t, fps) {
   if (!isFinite(t) || t < 0) t = 0;
@@ -91,6 +117,7 @@ function topbar(title) {
     title ? h('nav', { class: 'crumbs' }, h('span', { class: 'sep' }, '/'), h('span', { class: 'cur' }, title)) : null,
     h('div', { class: 'grow' }),
     S.name ? h('button', { class: 'backend-pill name-pill', title: 'Change your name', onclick: () => askName(true) }, icon('user'), S.name) : null,
+    themeButton(),
   ].filter(Boolean));
 }
 function fail(msg) {
