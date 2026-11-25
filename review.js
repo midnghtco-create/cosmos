@@ -391,7 +391,7 @@ async function loadViaRelay(v, onProgress, isCurrent) {
       done++; onProgress(done / n, total);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(4, n - 1) }, worker));
+  await Promise.all(Array.from({ length: Math.min(6, n - 1) }, worker));
   return URL.createObjectURL(new Blob(parts, { type: 'video/mp4' }));
 }
 
