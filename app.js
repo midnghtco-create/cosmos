@@ -888,7 +888,15 @@ function proxyModal(p, files, onlyId, onFinished) {
     body.replaceChildren(h('div', { class: 'center-msg small-msg' }, h('div', { class: 'spinner' }), h('p', {}, 'Looking for the proxy helper on this computer…')));
     foot.replaceChildren();
     let health;
-    try { health = await helperCall('/health'); } catch { return showInstall(); }
+    // Chrome holds requests to this computer until the person answers its
+    // "local network access" prompt, so explain that instead of spinning forever.
+    const hint = setTimeout(() => {
+      if (closed || !body.querySelector('.small-msg')) return;
+      body.querySelector('.small-msg').append(h('p', { class: 'warn' },
+        'Chrome is waiting for your permission. Look near the address bar for a prompt about accessing apps or devices on your local network and click Allow. No prompt? Click the icon at the left of the address bar, then set “Local network access” to Allow and reload.'));
+    }, 4000);
+    try { health = await helperCall('/health'); } catch { clearTimeout(hint); return showInstall(); }
+    clearTimeout(hint);
     if (closed) return;
     if (!health.ffmpeg) return showInstall('The helper is running but can’t find ffmpeg. Install it with:  brew install ffmpeg');
     const st = await helperCall('/status').catch(() => ({ jobs: [] }));
@@ -1167,7 +1175,7 @@ async function renderReview(pid, aid) {
   }
 
   // ── video loading
-  function showMsg(content) { stageMsg.replaceChildren(...[content].flat()); stageMsg.classList.remove('hidden'); }
+  function showMsg(content) { stageMsg.replaceChildren(...[content].flat().filter(Boolean)); stageMsg.classList.remove('hidden'); }
   function hideMsg() { stageMsg.classList.add('hidden'); }
 
   async function loadVersion({ keepTime = false } = {}) {
@@ -1229,7 +1237,56 @@ async function renderReview(pid, aid) {
   video.addEventListener('loadedmetadata', () => {
     hideMsg(); layoutInk(); renderMarkers(); updateTime();
     durEl.textContent = fmtTC(video.duration, rv.fps);
+    // Chrome can open a .mov whose video codec it can't decode (ProRes, 4:2:2 HEVC…):
+    // the timeline and audio work but the picture stays black. Say so.
+    if (!video.videoWidth) {
+      const v = curV();
+      const status = h('div', { class: 'proxy-wait hidden' });
+      const makeBtn = v.fileId ? h('button', { class: 'btn primary', onclick: () => proxyModal(p, [{ id: v.fileId, name: v.name }], v.fileId, async () => { await loadProxies(p, true); loadVersion({ keepTime: true }); }) }, icon('film'), 'Make a proxy') : null;
+      showMsg([
+        h('p', { class: 'error' }, 'This browser can’t show the picture in this file.'),
+        h('p', { class: 'faint small' }, 'The audio and timeline load, but the video codec (often ProRes or 10-bit 4:2:2 HEVC in camera .mov files) isn’t supported. A proxy fixes this: once it’s ready, it plays here automatically.'),
+        status, makeBtn,
+        h('button', { class: 'btn ghost', onclick: hideMsg }, 'Show anyway'),
+      ]);
+      if (v.fileId) watchProxyJob(v, status, makeBtn);
+    }
   });
+
+  // If the helper is already making a proxy for this version, show its progress
+  // and switch to the proxy as soon as it's uploaded.
+  function watchProxyJob(v, status, makeBtn) {
+    const myNav = navSeq;
+    let reached = false;
+    const tick = async () => {
+      if (myNav !== navSeq || curV() !== v || stageMsg.classList.contains('hidden')) return;
+      try {
+        const st = await helperCall('/status');
+        reached = true;
+        const job = st.jobs.filter((j) => j.fileId === v.fileId).pop();
+        if (job && !['error', 'skipped'].includes(job.state)) {
+          makeBtn?.classList.add('hidden');
+          status.classList.remove('hidden');
+          if (job.state === 'done') {
+            status.replaceChildren(h('p', {}, 'Proxy ready. Loading it…'));
+            await loadProxies(p, true);
+            return loadVersion({ keepTime: true });
+          }
+          status.replaceChildren(...[
+            h('p', { class: 'small' }, `Making a proxy: ${JOB_LABELS[job.state] || job.state}${job.detail ? ' · ' + job.detail : ''}`),
+            ['downloading', 'encoding', 'uploading'].includes(job.state) ? h('div', { class: 'bar' }, h('div', { style: { width: Math.round(job.progress * 100) + '%' } })) : null,
+          ].filter(Boolean));
+          if (job.state === 'waiting' && Store.backend === 'drive') helperCall('/token', { token: await Drive.getToken() }).catch(() => {});
+        } else if (job?.state === 'error') {
+          status.classList.remove('hidden');
+          status.replaceChildren(h('p', { class: 'error small' }, 'The last proxy attempt failed: ' + job.detail));
+          makeBtn?.classList.remove('hidden');
+        }
+      } catch { if (!reached) return; }
+      setTimeout(tick, 2000);
+    };
+    tick();
+  }
   video.addEventListener('error', () => {
     if (!video.getAttribute('src')) return;
     const code = video.error?.code;

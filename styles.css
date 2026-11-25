@@ -360,3 +360,5 @@ label.proxy-row:hover { background: var(--surface-2); }
 .bar { height: 4px; background: var(--surface-3); border-radius: 2px; margin-top: 6px; overflow: hidden; }
 .bar > div { height: 100%; background: var(--accent); transition: width .3s; }
 .small-msg { min-height: 160px; }
+.proxy-wait { width: min(420px, 100%); }
+.proxy-wait p { margin: 0 0 4px; }
