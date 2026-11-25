@@ -42,9 +42,41 @@ Permissions requested:
 - `drive.readonly`: lists your folders and streams your videos. The app never changes or deletes them.
 - `drive.file`: lets the app create and update its own notes file, and nothing else.
 
+## Proxies: smooth playback for big or unplayable files
+
+Large camera files and editing formats (ProRes, DNxHR, some HEVC) stream slowly or won't play in a browser. Cutroom can make a light **H.264 proxy** of each video for review.
+
+Proxy details:
+
+- Max 1080p (or 720p).
+- A keyframe every second, so seeking and frame stepping are instant.
+- "Faststart", so playback begins right away.
+- The original frame timing is kept, so note timecodes line up exactly.
+
+Proxies are saved in a **`Cutroom proxies`** folder inside the project's Drive folder. Cutroom plays the proxy automatically, and the **Proxy / Original** switch in the player swaps between them. Notes always belong to the original.
+
+The conversion runs on your computer through a small helper. It uses only the Python standard library plus ffmpeg, and uses Apple's hardware encoder when available.
+
+```bash
+brew install ffmpeg            # once
+cd ~/Downloads && curl -fsSLO https://midnghtco-create.github.io/cosmos/proxy-helper.py
+python3 proxy-helper.py        # leave this window open
+```
+
+Then, in a project, click **Make proxies**. For a single version, use **⋯ → Make a proxy for this version** in the review page.
+
+The helper:
+
+- only listens on `127.0.0.1`
+- only accepts requests from the Cutroom site
+- keeps your Google sign-in in memory only
+- deletes its temporary files after each video
+
+If Chrome asks whether the site may access devices on your local network, click **Allow**. That's how the page reaches the helper.
+
 ## Notes
 
-- **Formats:** browsers play H.264/AAC MP4 and WebM. ProRes, DNxHR and some HEVC `.mov` files won't play, so put an H.264 review export in the folder.
+- **Formats:** browsers play H.264/AAC MP4 and WebM. For ProRes, DNxHR or HEVC `.mov` files, make proxies (see above).
 - **New versions:** upload the new cut to the same Drive folder. In the review page, click **New version** and pick it.
 - **Sign-in lasts about 1 hour** (Google's limit for browser apps). After that, Google may show a quick re-sign-in popup.
 - **Local mode** keeps notes in this browser only. Use **Settings → Download backup** to keep a copy.

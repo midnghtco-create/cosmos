@@ -129,6 +129,8 @@ const saveSettings = () => writeJSON(SETTINGS_KEY, settings);
 // ───────────────────────── Google Drive ─────────────────────────
 const SCOPES = 'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file';
 const DATA_FILE = 'cutroom-data.json';
+const PROXY_FOLDER = 'Cutroom proxies';
+const HELPER_URL = 'http://127.0.0.1:8765';
 const TOKEN_KEY = 'cutroom:token';
 
 const Drive = {
@@ -201,6 +203,19 @@ const Drive = {
   videos(folder) {
     return this.list(`'${folder}' in parents and mimeType contains 'video/' and trashed=false`,
       'id,name,mimeType,size,thumbnailLink,videoMediaMetadata,modifiedTime,createdTime');
+  },
+  // Proxies live in a "Cutroom proxies" subfolder; each is tagged with the original's file id.
+  async proxies(folderId) {
+    const map = new Map();
+    const subs = await this.list(`'${folderId}' in parents and name='${PROXY_FOLDER}' and mimeType='application/vnd.google-apps.folder' and trashed=false`, 'id', null);
+    for (const s of subs) {
+      const files = await this.list(`'${s.id}' in parents and trashed=false and mimeType contains 'video/'`, 'id,name,size,appProperties,thumbnailLink,modifiedTime', null);
+      for (const f of files) {
+        const of = f.appProperties?.cutroomProxyOf;
+        if (of && (!map.has(of) || (f.modifiedTime || '') > (map.get(of).modifiedTime || ''))) map.set(of, f);
+      }
+    }
+    return map;
   },
   async meta(id) { return (await this.api(`files/${id}?fields=id,name,mimeType&supportsAllDrives=true`)).json(); },
   async about() { return (await this.api('about?fields=user(displayName,emailAddress)')).json(); },
@@ -711,7 +726,16 @@ function folderPicker(onPick) {
 
 // ───────────────────────── project page (asset grid) ─────────────────────────
 const folderCache = new Map();
+const proxyCache = new Map(); // projectId -> Map(originalFileId -> proxy file)
 let gridFilter = 'all';
+
+async function loadProxies(p, force) {
+  if (!p.folderId) return new Map();
+  if (!force && proxyCache.has(p.id)) return proxyCache.get(p.id);
+  const m = await Drive.proxies(p.folderId).catch(() => new Map());
+  proxyCache.set(p.id, m);
+  return m;
+}
 
 function driveItems(p, files) {
   const assets = projectAssets(p.id);
@@ -765,7 +789,7 @@ async function renderProject(pid) {
     if (!force && folderCache.has(p.id)) { items = driveItems(p, folderCache.get(p.id)); draw(); }
     else grid.replaceChildren(...Array.from({ length: 6 }, () => h('div', { class: 'card asset-card skeleton' }, h('div', { class: 'thumb' }), h('div', { class: 'ac-body' }, h('div', { class: 'sk-line' }), h('div', { class: 'sk-line short' })))));
     try {
-      const files = await Drive.videos(p.folderId);
+      const [files] = await Promise.all([Drive.videos(p.folderId), loadProxies(p, true)]);
       folderCache.set(p.id, files);
       if (nav !== navSeq) return;
       items = driveItems(p, files);
@@ -789,6 +813,7 @@ async function renderProject(pid) {
       h('h1', {}, p.name),
       h('div', { class: 'grow' }),
       isDrive ? h('a', { class: 'btn ghost', href: `https://drive.google.com/drive/folders/${p.folderId}`, target: '_blank', rel: 'noopener' }, icon('external'), 'Open in Drive') : null,
+      isDrive ? h('button', { class: 'btn', title: 'Make smaller H.264 copies that stream and scrub smoothly', onclick: () => proxyModal(p, folderCache.get(p.id) || [], null, () => loadDrive(true)) }, icon('film'), 'Make proxies') : null,
       isDrive ? h('button', { class: 'btn', onclick: () => loadDrive(true) }, icon('refresh'), 'Refresh')
         : h('button', { class: 'btn primary', onclick: addFiles }, icon('plus'), 'Add videos')),
     chips, grid);
@@ -810,10 +835,12 @@ function assetCard(p, it) {
   const total = a ? a.comments.length : 0;
   let thumb;
   let dur = null;
+  const proxy = it.file && proxyCache.get(p.id)?.get(it.file.id);
   if (it.file) {
     dur = it.file.videoMediaMetadata?.durationMillis ? Number(it.file.videoMediaMetadata.durationMillis) / 1000 : null;
-    thumb = it.file.thumbnailLink
-      ? h('img', { src: it.file.thumbnailLink.replace(/=s\d+$/, '=s640'), alt: '', loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (e) => e.target.replaceWith(h('div', { class: 'thumb-ph' }, icon('film'))) })
+    const thumbLink = it.file.thumbnailLink || proxy?.thumbnailLink;
+    thumb = thumbLink
+      ? h('img', { src: thumbLink.replace(/=s\d+$/, '=s640'), alt: '', loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (e) => e.target.replaceWith(h('div', { class: 'thumb-ph' }, icon('film'))) })
       : h('div', { class: 'thumb-ph' }, icon('film'), h('small', {}, 'Drive is still processing'));
   } else if (a) {
     const v = a.versions[a.versions.length - 1];
@@ -825,11 +852,123 @@ function assetCard(p, it) {
   return h('a', { class: 'card asset-card', href: `#/r/${p.id}/${encodeURIComponent(it.id)}` },
     h('div', { class: 'thumb' }, thumb,
       versions > 1 ? h('span', { class: 'badge vbadge', title: `${versions} versions` }, icon('layers'), 'v' + versions) : null,
-      dur ? h('span', { class: 'badge dur' }, fmtDur(dur)) : null),
+      dur ? h('span', { class: 'badge dur' }, fmtDur(dur)) : null,
+      proxy ? h('span', { class: 'badge pbadge', title: 'Plays from a smooth-streaming proxy' }, 'Proxy') : null),
     h('div', { class: 'ac-body' },
       h('div', { class: 'ac-name', title: name }, name),
       h('div', { class: 'ac-meta' }, statusPill(a?.status),
         total ? h('span', { class: 'muted note-count', title: `${open} open of ${total} notes` }, icon('comment'), `${open}/${total}`) : null)));
+}
+
+// ───────────────────────── proxies (via the local helper) ─────────────────────────
+async function helperCall(path, body) {
+  const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {};
+  const r = await fetch(HELPER_URL + path, { ...opts, cache: 'no-store' });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `Helper replied ${r.status}`);
+  return j;
+}
+
+const JOB_LABELS = {
+  queued: 'Waiting', checking: 'Checking', downloading: 'Downloading original', encoding: 'Converting',
+  uploading: 'Uploading proxy', done: 'Done', skipped: 'Already has a proxy', error: 'Failed', waiting: 'Needs sign-in',
+};
+
+function proxyModal(p, files, onlyId, onFinished) {
+  const body = h('div', { class: 'proxy-body' });
+  const foot = h('div', { class: 'row gap grow end' });
+  let timer = null, closed = false, startedHere = false;
+  const m = modal({
+    title: 'Make smooth-streaming proxies', wide: true, body, foot: [foot],
+    onClose: () => { closed = true; clearTimeout(timer); if (startedHere) onFinished?.(); },
+  });
+  const helperFile = new URL('proxy-helper.py', location.href).href;
+
+  async function start() {
+    body.replaceChildren(h('div', { class: 'center-msg small-msg' }, h('div', { class: 'spinner' }), h('p', {}, 'Looking for the proxy helper on this computer…')));
+    foot.replaceChildren();
+    let health;
+    try { health = await helperCall('/health'); } catch { return showInstall(); }
+    if (closed) return;
+    if (!health.ffmpeg) return showInstall('The helper is running but can’t find ffmpeg. Install it with:  brew install ffmpeg');
+    const st = await helperCall('/status').catch(() => ({ jobs: [] }));
+    const active = st.jobs.filter((j) => j.folderId === p.folderId && !['done', 'skipped', 'error'].includes(j.state));
+    if (active.length) { startedHere = true; return showProgress(); }
+    showPicker(health);
+  }
+
+  function showInstall(problem) {
+    body.replaceChildren(
+      h('p', {}, 'Proxies are smaller H.264 copies of your videos. They stream smoothly, seek instantly and step frame by frame, and they play even when the original is ProRes or HEVC. Cutroom keeps them in a “', PROXY_FOLDER, '” folder next to the originals, and your notes stay on the originals.'),
+      h('p', {}, 'Converting video needs your computer, so a small helper does the work. Open Terminal and run these two commands, then leave the window open:'),
+      h('code', { class: 'block' }, `cd ~/Downloads && curl -fsSLO ${helperFile}`),
+      h('code', { class: 'block' }, 'python3 proxy-helper.py'),
+      h('p', { class: 'muted small' }, 'It needs ffmpeg (', h('code', {}, 'brew install ffmpeg'), '). If Chrome asks whether this site may access devices on your local network, click Allow: that’s how the page talks to the helper.'),
+      ...(problem ? [h('p', { class: 'warn' }, problem)] : []));
+    foot.replaceChildren(h('button', { class: 'btn ghost', onclick: () => m.close() }, 'Close'), h('button', { class: 'btn primary', onclick: start }, 'I started it, check again'));
+  }
+
+  function showPicker(health) {
+    const proxies = proxyCache.get(p.id) || new Map();
+    const rows = files.map((f) => {
+      const has = proxies.has(f.id);
+      const cb = h('input', { type: 'checkbox', checked: onlyId ? f.id === onlyId : !has });
+      cb.checked = onlyId ? f.id === onlyId : !has;
+      return { f, cb, el: h('label', { class: 'proxy-row' }, cb, h('span', { class: 'grow' }, f.name),
+        f.size ? h('span', { class: 'faint small' }, `${(Number(f.size) / 1e9).toFixed(2)} GB`) : null,
+        has ? h('span', { class: 'pill st-approved' }, 'Has proxy') : null) };
+    });
+    const res = h('select', { class: 'select' }, h('option', { value: 1080 }, '1080p (recommended)'), h('option', { value: 720 }, '720p (smallest, fastest)'), h('option', { value: 0 }, 'Original size'));
+    const force = h('input', { type: 'checkbox' });
+    body.replaceChildren(
+      h('p', { class: 'muted small' }, `Helper found · encoder: ${health.encoder === 'h264_videotoolbox' ? 'Apple hardware (fast)' : health.encoder}. Each video is downloaded, converted on this computer, then uploaded to “${PROXY_FOLDER}” in this project’s Drive folder.`),
+      files.length ? h('div', { class: 'folder-list proxy-list' }, rows.map((r) => r.el)) : h('p', { class: 'muted' }, 'No videos in this folder yet.'),
+      h('div', { class: 'row gap proxy-opts' }, h('label', { class: 'field' }, h('span', {}, 'Size'), res),
+        h('label', { class: 'row gap small' }, force, 'Replace proxies that already exist')));
+    foot.replaceChildren(h('button', { class: 'btn ghost', onclick: () => m.close() }, 'Cancel'),
+      h('button', { class: 'btn primary', onclick: async () => {
+        const chosen = rows.filter((r) => r.cb.checked).map((r) => ({ id: r.f.id, name: r.f.name, size: r.f.size }));
+        if (!chosen.length) return toast('Tick at least one video');
+        try {
+          await helperCall('/jobs', { token: await Drive.getToken(), folderId: p.folderId, files: chosen, resolution: Number(res.value), force: force.checked });
+          startedHere = true;
+          showProgress();
+        } catch (e) { toast('Could not start: ' + e.message); }
+      } }, 'Make proxies'));
+  }
+
+  function showProgress() {
+    const list = h('div', { class: 'folder-list proxy-list' });
+    const summary = h('p', { class: 'muted small' });
+    body.replaceChildren(summary, list,
+      h('p', { class: 'faint small' }, 'You can close this window: the helper keeps working as long as its Terminal window stays open. Keep a Cutroom tab open too, so it can renew the helper’s Google sign-in for long batches.'));
+    foot.replaceChildren(h('button', { class: 'btn', onclick: () => m.close() }, 'Close'));
+    let lastTokenPush = Date.now();
+    const poll = async () => {
+      if (closed) return;
+      try {
+        const st = await helperCall('/status');
+        const jobs = st.jobs.filter((j) => j.folderId === p.folderId);
+        const needsToken = !st.hasToken || jobs.some((j) => j.state === 'waiting') || Date.now() - lastTokenPush > 20 * 60 * 1000;
+        if (needsToken && Store.backend === 'drive') { lastTokenPush = Date.now(); helperCall('/token', { token: await Drive.getToken() }).catch(() => {}); }
+        list.replaceChildren(...jobs.map((j) => h('div', { class: 'proxy-row' + (j.state === 'error' ? ' failed' : '') },
+          h('div', { class: 'grow' },
+            h('div', { class: 'proxy-name' }, j.name),
+            h('div', { class: 'faint small' }, JOB_LABELS[j.state] || j.state, j.detail ? ' · ' + j.detail : ''),
+            ['downloading', 'encoding', 'uploading'].includes(j.state) ? h('div', { class: 'bar' }, h('div', { style: { width: Math.round(j.progress * 100) + '%' } })) : null),
+          j.state === 'done' ? h('span', { class: 'pill st-approved' }, 'Ready') : j.state === 'error' ? h('span', { class: 'pill st-changes' }, 'Failed') : null)));
+        const left = jobs.filter((j) => !['done', 'skipped', 'error'].includes(j.state)).length;
+        summary.textContent = left ? `Working on ${jobs.length - left + 1} of ${jobs.length}…` : `Finished: ${jobs.filter((j) => j.state === 'done').length} made, ${jobs.filter((j) => j.state === 'error').length} failed.`;
+        if (!left && startedHere) { await loadProxies(p, true); onFinished?.(); startedHere = false; }
+      } catch {
+        summary.textContent = 'Lost contact with the helper. Is its Terminal window still open?';
+      }
+      timer = setTimeout(poll, 1000);
+    };
+    poll();
+  }
+
+  start();
 }
 
 // ───────────────────────── review page ─────────────────────────
@@ -899,11 +1038,17 @@ async function renderReview(pid, aid) {
   const muteBtn = h('button', { class: 'ctl', title: 'Mute (M)' }, icon('volume'));
   const vol = h('input', { type: 'range', class: 'vol', min: 0, max: 1, step: 0.05, value: readJSON('cutroom:vol', 1), title: 'Volume' });
   const fsBtn = h('button', { class: 'ctl', title: 'Fullscreen (F)' }, icon('expand'));
+  const srcSel = h('select', { class: 'select sm hidden', title: 'Play the smooth proxy or the original file' },
+    h('option', { value: 'proxy' }, 'Proxy'), h('option', { value: 'original' }, 'Original'));
+  srcSel.addEventListener('change', () => {
+    writeJSON('cutroom:source', srcSel.value);
+    loadVersion({ keepTime: true });
+  });
   const player = h('div', { class: 'player' }, stage,
     h('div', { class: 'controls' }, scrub,
       h('div', { class: 'ctl-row' }, playBtn, stepB, stepF,
         h('span', { class: 'tc-wrap' }, tcEl, h('span', { class: 'faint' }, ' / '), durEl),
-        h('div', { class: 'grow' }), loopBtn, speedSel, fpsSel, muteBtn, vol, fsBtn)));
+        h('div', { class: 'grow' }), srcSel, loopBtn, speedSel, fpsSel, muteBtn, vol, fsBtn)));
 
   // ── composer DOM
   const composeTc = h('button', { class: 'tc chip', title: 'Jump to this frame' }, '00:00:00:00');
@@ -1003,6 +1148,8 @@ async function renderReview(pid, aid) {
     popMenu(anchor, [
       { label: 'Rename this version', onclick: () => promptModal('Rename version', 'Label', v.name, (val) => { v.name = val; Store.save(); fillVersions(); }) },
       v.fileId ? { label: 'Open file in Drive', icon: 'external', onclick: () => window.open(`https://drive.google.com/file/d/${v.fileId}/view`, '_blank', 'noopener') } : null,
+      v.fileId ? { label: proxyCache.get(p.id)?.get(v.fileId) ? 'Remake proxy for this version' : 'Make a proxy for this version', icon: 'film',
+        onclick: () => proxyModal(p, [{ id: v.fileId, name: v.name }], v.fileId, async () => { await loadProxies(p, true); loadVersion({ keepTime: true }); }) } : null,
       asset.versions.length > 1 ? { label: 'Unstack into its own item', onclick: unstack } : null,
     ]);
   }
@@ -1023,10 +1170,11 @@ async function renderReview(pid, aid) {
   function showMsg(content) { stageMsg.replaceChildren(...[content].flat()); stageMsg.classList.remove('hidden'); }
   function hideMsg() { stageMsg.classList.add('hidden'); }
 
-  async function loadVersion() {
+  async function loadVersion({ keepTime = false } = {}) {
+    const resumeAt = keepTime ? video.currentTime : 0;
     fillVersions();
     video.pause();
-    rv.selected = null; rv.strokes = []; rv.current = null; rv.pinT = null; textarea.value = ''; setTool(null);
+    if (!keepTime) { rv.selected = null; rv.strokes = []; rv.current = null; rv.pinT = null; textarea.value = ''; setTool(null); }
     if (rv.blobUrl) { URL.revokeObjectURL(rv.blobUrl); rv.blobUrl = null; }
     renderComments(); renderMarkers(); renderInk();
     const v = curV();
@@ -1034,10 +1182,18 @@ async function renderReview(pid, aid) {
     let src = null;
     if (v.fileId) {
       showMsg([h('div', { class: 'spinner' }), h('p', {}, 'Streaming from Drive…')]);
-      if (swReady) src = './__drive/' + v.fileId;
+      const proxy = (await loadProxies(p)).get(v.fileId);
+      if (myNav !== navSeq || curV() !== v) return;
+      srcSel.classList.toggle('hidden', !proxy);
+      if (proxy) {
+        srcSel.value = readJSON('cutroom:source', 'proxy') === 'original' ? 'original' : 'proxy';
+        srcSel.options[0].textContent = `Proxy ${proxy.appProperties?.cutroomProxyRes && proxy.appProperties.cutroomProxyRes !== '0' ? proxy.appProperties.cutroomProxyRes + 'p' : ''}`.trim();
+      }
+      const playId = proxy && srcSel.value === 'proxy' ? proxy.id : v.fileId;
+      if (swReady) src = './__drive/' + playId;
       else {
         try {
-          const r = await Drive.api(`files/${v.fileId}?alt=media&supportsAllDrives=true`);
+          const r = await Drive.api(`files/${playId}?alt=media&supportsAllDrives=true`);
           src = rv.blobUrl = URL.createObjectURL(await r.blob());
         } catch (e) { showMsg(h('p', { class: 'error' }, 'Could not load from Drive: ' + e.message)); return; }
       }
@@ -1048,6 +1204,7 @@ async function renderReview(pid, aid) {
     if (myNav !== navSeq) return;
     video.src = src;
     video.load();
+    if (resumeAt) video.addEventListener('loadedmetadata', () => seekTo(resumeAt), { once: true });
   }
   function showRelink(v) {
     video.removeAttribute('src'); video.load();
@@ -1080,7 +1237,7 @@ async function renderReview(pid, aid) {
       ? 'This video can’t be played in the browser.'
       : 'The video stopped loading.'),
       h('p', { class: 'faint small' }, code === 4
-        ? 'Browsers play H.264/AAC MP4 and WebM. ProRes, DNxHR and some HEVC .mov files won’t play — export an H.264 review copy into the folder.'
+        ? (curV().fileId ? 'Browsers can’t play ProRes, DNxHR and some HEVC .mov files. Use “Make a proxy for this version” in the version menu (⋯) to create a playable copy.' : 'Browsers play H.264/AAC MP4 and WebM. ProRes, DNxHR and some HEVC .mov files won’t play.')
         : (curV().fileId ? 'Your Google session may have expired. Reload the page and sign in again.' : 'Try opening the file again.')),
       h('button', { class: 'btn', onclick: () => loadVersion() }, 'Retry')]);
   });

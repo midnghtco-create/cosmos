@@ -344,3 +344,19 @@ kbd { font-family: var(--mono); font-size: 12px; background: var(--surface-2); b
   .title-input { flex-basis: 100%; order: -1; }
   .seg .select { max-width: 150px; }
 }
+
+/* ── proxies ── */
+.pbadge { top: 8px; right: 8px; background: rgba(124, 108, 255, .85); }
+.proxy-list { max-height: 300px; }
+.proxy-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.proxy-row:last-child { border-bottom: 0; }
+label.proxy-row { cursor: pointer; }
+label.proxy-row:hover { background: var(--surface-2); }
+.proxy-row input { accent-color: var(--accent); width: 16px; height: 16px; }
+.proxy-row.failed .faint { color: var(--bad); }
+.proxy-name { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proxy-opts { margin-top: 14px; align-items: flex-end; flex-wrap: wrap; }
+.proxy-opts .field { margin: 0; }
+.bar { height: 4px; background: var(--surface-3); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+.bar > div { height: 100%; background: var(--accent); transition: width .3s; }
+.small-msg { min-height: 160px; }
