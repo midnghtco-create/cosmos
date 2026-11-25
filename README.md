@@ -74,6 +74,32 @@ The helper:
 
 If Chrome asks whether the site may access devices on your local network, click **Allow**. That's how the page reaches the helper.
 
+## Client review links
+
+Clients don't need a Google account to review. Open a video, click **Share**, then **Create link**, and send them the link (`review.html#t=…`).
+
+What the client can do:
+
+- Watch the shared video. Versions are optional.
+- Add timestamped comments, with drawings unless you turn that off.
+- Reply to any comment.
+- They can't see anything else, and they can't edit, resolve or delete.
+
+How it shows up for you:
+
+- Their comments appear in your review tagged **Client**.
+- Your notes appear for them tagged **Team**.
+- Your replies, resolves and hidden comments sync both ways.
+- **Turn link off** closes the link and restores the video file's previous Drive sharing.
+
+How it works:
+
+- **Comment store.** `apps-script/Code.gs` is a Google Apps Script web app that runs in your own Google account. It is set to "Execute as: Me" and "Who has access: Anyone". It saves one JSON file per link in a "Cutroom client links" Drive folder. Only requests carrying your private owner key can publish, sync or turn off a link. That key lives in the deployed script and in your Cutroom notes, never on the website.
+- **Video.** Cutroom sets the shared file (the proxy when there is one) to "anyone with the link can view". The client page streams it with a read-only API key that only works from this site.
+- **Public settings.** `config.js` holds the comment store's address and the API key. Neither is secret.
+
+To redeploy the script, paste `apps-script/Code.gs` into script.google.com. Replace `__OWNER_KEY__` with a long random key, then use **Deploy → New deployment → Web app**. Put the new `/exec` address in `config.js`. In Cutroom, the **Share** button asks for the owner key once.
+
 ## Notes
 
 - **Formats:** browsers play H.264/AAC MP4 and WebM. For ProRes, DNxHR or HEVC `.mov` files, make proxies (see above).

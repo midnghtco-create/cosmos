@@ -362,3 +362,18 @@ label.proxy-row:hover { background: var(--surface-2); }
 .small-msg { min-height: 160px; }
 .proxy-wait { width: min(420px, 100%); }
 .proxy-wait p { margin: 0 0 4px; }
+
+/* ── client review page ── */
+.client-title { min-width: 0; padding: 2px 8px; }
+.title-static { font-size: 16px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.client-hint { margin-left: 8px; }
+.name-pill { background: transparent; cursor: pointer; }
+.name-pill:hover { color: var(--text); border-color: var(--border-2); }
+.team-tag { font-size: 10.5px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; color: var(--accent-2); background: var(--accent-soft); padding: 1px 6px; border-radius: 4px; margin-left: 4px; }
+.client-tag { font-size: 10.5px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; color: var(--warn); background: var(--warn-soft); padding: 1px 6px; border-radius: 4px; margin-left: 4px; }
+.marker.team { background: var(--accent-2); }
+.pill .ic { width: 12px; height: 12px; margin-right: 3px; }
+.share-url { display: flex; gap: 8px; }
+.share-url .input { font-family: var(--mono); font-size: 12.5px; }
+.sbadge { bottom: 8px; left: 8px; background: rgba(251, 191, 36, .9); color: #1d1500; }
+@media (max-width: 960px) { .client-hint { display: none; } }

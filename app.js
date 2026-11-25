@@ -99,6 +99,8 @@ const ICONS = {
   more: '<circle cx="5" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.6" fill="currentColor" stroke="none"/>',
   loop: '<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
   upload: '<path d="M12 21V9M7 14l5-5 5 5M5 3h14"/>',
+  share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 13.5 6.8 4M15.4 6.5l-6.8 4"/>',
+  copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
 };
 function icon(name) {
   return h('span', { class: 'ic', 'aria-hidden': 'true', html: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[name] || ''}</svg>` });
@@ -302,7 +304,9 @@ const Store = {
     this.backend = backend;
     this.data = backend === 'local' ? normalizeData(readJSON(LOCAL_DATA_KEY, null)) : await Drive.loadData();
   },
-  save() {
+  onSave: null,
+  save(opts) {
+    if (!opts?.quiet) this.onSave?.();
     this.dirty = true;
     setSaveState('saving');
     clearTimeout(this.timer);
@@ -794,6 +798,11 @@ async function renderProject(pid) {
       if (nav !== navSeq) return;
       items = driveItems(p, files);
       draw();
+      // pull new client comments for this project's shared videos in the background
+      if (linksReady()) {
+        const shared = projectAssets(p.id).filter((a) => a.share?.token && !a.share.revoked);
+        Promise.allSettled(shared.map((a) => syncShare(p, a))).then(() => { if (nav === navSeq && shared.length) draw(); });
+      }
     } catch (e) {
       if (nav !== navSeq) return;
       grid.replaceChildren(errorBox('Could not list this folder: ' + e.message, () => loadDrive(true)));
@@ -853,7 +862,8 @@ function assetCard(p, it) {
     h('div', { class: 'thumb' }, thumb,
       versions > 1 ? h('span', { class: 'badge vbadge', title: `${versions} versions` }, icon('layers'), 'v' + versions) : null,
       dur ? h('span', { class: 'badge dur' }, fmtDur(dur)) : null,
-      proxy ? h('span', { class: 'badge pbadge', title: 'Plays from a smooth-streaming proxy' }, 'Proxy') : null),
+      proxy ? h('span', { class: 'badge pbadge', title: 'Plays from a smooth-streaming proxy' }, 'Proxy') : null,
+      a?.share?.token && !a.share.revoked ? h('span', { class: 'badge sbadge', title: 'Has an active client link' }, icon('share'), 'Client link') : null),
     h('div', { class: 'ac-body' },
       h('div', { class: 'ac-name', title: name }, name),
       h('div', { class: 'ac-meta' }, statusPill(a?.status),
@@ -979,6 +989,139 @@ function proxyModal(p, files, onlyId, onFinished) {
   start();
 }
 
+// ───────────────────────── client review links ─────────────────────────
+// Clients open review.html#t=<token>. The comment store is a Google Apps Script
+// web app in the owner's account (apps-script/Code.gs). This side publishes the
+// video and your notes, and merges client comments and replies back in.
+const PUB = window.CUTROOM_PUBLIC || {};
+const linksReady = () => !!(PUB.linksEndpoint && !PUB.linksEndpoint.startsWith('__') && Store.data.links?.ownerKey);
+function newToken() {
+  const b = crypto.getRandomValues(new Uint8Array(18));
+  return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function shareUrl(token) {
+  const base = PUB.siteUrl && !PUB.siteUrl.startsWith('__') ? PUB.siteUrl : new URL('.', location.href).href;
+  return new URL('review.html', base).href + '#t=' + token;
+}
+async function linksCall(body) {
+  const r = await fetch(PUB.linksEndpoint, { method: 'POST', body: JSON.stringify({ ownerKey: Store.data.links?.ownerKey, ...body }) });
+  const j = await r.json().catch(() => ({ error: 'The links service didn’t answer properly' }));
+  if (j.error) throw new Error(j.error);
+  return j;
+}
+
+async function syncShare(p, asset) {
+  const share = asset.share;
+  const proxies = await loadProxies(p);
+  const versions = (share.scope === 'latest' ? asset.versions.slice(-1) : asset.versions).filter((v) => v.fileId);
+  if (!versions.length) throw new Error('Only Drive videos can be shared');
+  const ids = new Set(versions.map((v) => v.id));
+  const mine = asset.comments.filter((c) => c.source !== 'client' && ids.has(c.versionId));
+  const replies = {};
+  for (const c of asset.comments) {
+    if (!ids.has(c.versionId)) continue;
+    const own = c.replies.filter((r) => r.source !== 'client');
+    if (own.length) replies[c.id] = own.map((r) => ({ id: r.id, text: r.text, author: r.author, createdAt: r.createdAt }));
+  }
+  const res = await linksCall({
+    action: 'sync', token: share.token, title: asset.name, project: p.name, status: asset.status, allowDraw: share.allowDraw !== false,
+    versions: versions.map((v) => ({ id: v.id, label: v.name, fileId: proxies.get(v.fileId)?.id || v.fileId, fps: asset.fps || settings.fps || 24 })),
+    owner: {
+      comments: mine.map((c) => ({ id: c.id, versionId: c.versionId, t: c.t, text: c.text, drawing: c.drawing, author: c.author, createdAt: c.createdAt })),
+      replies,
+      resolved: asset.comments.filter((c) => c.resolved && ids.has(c.versionId)).map((c) => c.id),
+      hidden: share.hidden || [],
+    },
+  });
+  mergeShareThread(asset, res);
+  share.syncedAt = Date.now();
+  Store.save({ quiet: true });
+  return res;
+}
+
+function mergeShareThread(asset, thread) {
+  const byId = new Map(asset.comments.map((c) => [c.id, c]));
+  const hidden = new Set(asset.share?.hidden || []);
+  for (const sc of thread.comments || []) {
+    let c = byId.get(sc.id);
+    if (sc.source === 'client') {
+      if (hidden.has(sc.id)) continue;
+      if (!c) {
+        c = { id: sc.id, source: 'client', versionId: sc.versionId, t: sc.t, text: sc.text, drawing: sc.drawing || null, author: sc.author, createdAt: sc.createdAt, resolved: false, replies: [] };
+        asset.comments.push(c); byId.set(c.id, c);
+      }
+    }
+    if (!c) continue;
+    const have = new Set(c.replies.map((r) => r.id));
+    for (const r of sc.replies || []) {
+      if (r.source === 'client' && !have.has(r.id)) c.replies.push({ id: r.id, source: 'client', text: r.text, author: r.author, createdAt: r.createdAt });
+    }
+    c.replies.sort((a, b) => a.createdAt - b.createdAt);
+  }
+}
+
+function shareModal(p, asset, onChange) {
+  const body = h('div');
+  const foot = h('div', { class: 'row gap grow end' });
+  const m = modal({ title: `Client link for “${asset.name}”`, wide: true, body, foot: [foot] });
+
+  function setup() {
+    const key = h('input', { class: 'input mono', placeholder: 'Owner key from your Cutroom links script' });
+    body.replaceChildren(
+      h('p', {}, 'Client links need the Cutroom links script in your Google account (it stores client comments in your Drive).'),
+      PUB.linksEndpoint && !PUB.linksEndpoint.startsWith('__')
+        ? h('label', { class: 'field' }, h('span', {}, 'Owner key'), key)
+        : h('p', { class: 'warn' }, 'This copy of Cutroom has no links service configured (config.js).'));
+    foot.replaceChildren(h('button', { class: 'btn ghost', onclick: () => m.close() }, 'Close'),
+      h('button', { class: 'btn primary', onclick: async () => {
+        const k = key.value.trim(); if (!k) return toast('Paste the owner key first');
+        try { await fetch(PUB.linksEndpoint, { method: 'POST', body: JSON.stringify({ action: 'list', ownerKey: k }) }).then((r) => r.json()).then((j) => { if (j.error) throw new Error(j.error); }); }
+        catch (e) { return toast('That key didn’t work: ' + e.message); }
+        Store.data.links = { ownerKey: k }; Store.save({ quiet: true }); show();
+      } }, 'Save key'));
+  }
+
+  function show() {
+    if (!linksReady()) return setup();
+    const s = asset.share;
+    if (s?.token && !s.revoked) {
+      const url = shareUrl(s.token);
+      const input = h('input', { class: 'input', value: url, readonly: true, onfocus: (e) => e.target.select() });
+      const counts = asset.comments.filter((c) => c.source === 'client').length;
+      body.replaceChildren(
+        h('p', {}, 'Anyone with this link can watch this video and add comments, drawings and replies. They can’t see your other videos, edit, resolve or delete anything.'),
+        h('div', { class: 'share-url' }, input, h('button', { class: 'btn primary', onclick: async () => { try { await navigator.clipboard.writeText(url); toast('Link copied'); } catch { input.select(); toast('Press ⌘C to copy'); } } }, icon('copy'), 'Copy')),
+        h('p', { class: 'muted small' }, `${counts} client comment${counts === 1 ? '' : 's'} so far · shares ${s.scope === 'latest' ? 'the latest version only' : 'all versions'}${s.allowDraw === false ? ' · drawing off' : ''} · last synced ${s.syncedAt ? timeAgo(s.syncedAt) : 'never'}`),
+        h('p', { class: 'faint small' }, 'The video file is set to “anyone with the link can view” in Drive so the client can stream it (the proxy when there is one). Turning the link off restores the previous Drive sharing.'));
+      foot.replaceChildren(
+        h('button', { class: 'btn ghost', onclick: async () => {
+          if (!confirm('Turn this link off? The client will no longer be able to open it. Their comments stay in your review.')) return;
+          try { await linksCall({ action: 'revoke', token: s.token }); s.revoked = true; Store.save({ quiet: true }); toast('Link turned off'); show(); onChange?.(); }
+          catch (e) { toast('Couldn’t turn it off: ' + e.message); }
+        } }, 'Turn link off'),
+        h('div', { class: 'grow' }),
+        h('button', { class: 'btn', onclick: async () => { try { await syncShare(p, asset); toast('Synced'); show(); onChange?.(); } catch (e) { toast('Sync failed: ' + e.message); } } }, icon('refresh'), 'Sync now'),
+        h('button', { class: 'btn primary', onclick: () => m.close() }, 'Done'));
+      return;
+    }
+    const scope = h('select', { class: 'select' }, h('option', { value: 'all' }, 'All versions'), h('option', { value: 'latest' }, 'Latest version only'));
+    const draw = h('input', { type: 'checkbox', checked: true }); draw.checked = true;
+    const hasProxy = asset.versions.some((v) => proxyCache.get(p.id)?.get(v.fileId));
+    body.replaceChildren(
+      h('p', {}, 'Create a private link your client can open without signing in. They can watch, add timestamped comments and drawings, and reply. Their comments appear here, tagged “Client”, and your notes appear for them, tagged “Team”.'),
+      h('div', { class: 'row gap proxy-opts' }, h('label', { class: 'field' }, h('span', {}, 'Share'), scope), h('label', { class: 'row gap small' }, draw, 'Let them draw on frames')),
+      hasProxy ? null : h('p', { class: 'warn' }, 'Tip: this video has no proxy. Clients will stream the original file, which may be large or not play in their browser. Make a proxy first for smooth review.'));
+    foot.replaceChildren(h('button', { class: 'btn ghost', onclick: () => m.close() }, 'Cancel'),
+      h('button', { class: 'btn primary', onclick: async (e) => {
+        e.currentTarget.disabled = true; e.currentTarget.textContent = 'Creating…';
+        asset.share = { token: newToken(), createdAt: Date.now(), scope: scope.value, allowDraw: draw.checked, hidden: [] };
+        try { await syncShare(p, asset); Store.save({ quiet: true }); show(); onChange?.(); }
+        catch (err) { delete asset.share; toast('Couldn’t create the link: ' + err.message); show(); }
+      } }, icon('share'), 'Create link'));
+  }
+  show();
+}
+
 // ───────────────────────── review page ─────────────────────────
 async function renderReview(pid, aid) {
   const p = findProject(pid);
@@ -1092,6 +1235,7 @@ async function renderReview(pid, aid) {
       h('button', { class: 'icon-btn sm', title: 'Version options', onclick: (e) => versionMenu(e.currentTarget) }, icon('more'))),
     h('button', { class: 'btn sm', onclick: () => addVersion() }, icon('plus'), 'New version'),
     statusSel,
+    p.folderId ? h('button', { class: 'btn sm' + (asset.share?.token && !asset.share.revoked ? ' shared' : ''), title: 'Get a link clients can comment on', onclick: () => shareModal(p, asset, () => { renderComments(); renderMarkers(); }) }, icon('share'), asset.share?.token && !asset.share.revoked ? 'Shared' : 'Share') : null,
     h('button', { class: 'btn sm', onclick: (e) => exportMenu(e.currentTarget) }, icon('download'), 'Export'),
     h('button', { class: 'icon-btn', title: 'Keyboard shortcuts (?)', onclick: showShortcuts }, icon('keyboard')));
 
@@ -1536,8 +1680,8 @@ async function renderReview(pid, aid) {
     const el = h('div', { class: 'cmt' + (c.resolved ? ' resolved' : '') + (rv.selected === c.id ? ' selected' : ''), 'data-id': c.id });
     const textEl = h('div', { class: 'cmt-text' }, c.text || h('em', { class: 'faint' }, 'Drawing only'));
     const replies = h('div', { class: 'replies' }, c.replies.map((r) => h('div', { class: 'reply' },
-      h('div', { class: 'cmt-meta' }, h('span', { class: 'author' }, r.author), h('span', { class: 'faint' }, ' · ' + timeAgo(r.createdAt)),
-        h('button', { class: 'link-btn faint', onclick: () => { if (!confirm('Delete this reply?')) return; c.replies = c.replies.filter((x) => x.id !== r.id); Store.save(); renderComments(); } }, 'Delete')),
+      h('div', { class: 'cmt-meta' }, h('span', { class: 'author' }, r.author), r.source === 'client' ? h('span', { class: 'client-tag' }, 'Client') : null, h('span', { class: 'faint' }, ' · ' + timeAgo(r.createdAt)),
+        r.source === 'client' ? null : h('button', { class: 'link-btn faint', onclick: () => { if (!confirm('Delete this reply?')) return; c.replies = c.replies.filter((x) => x.id !== r.id); Store.save(); renderComments(); } }, 'Delete')),
       h('div', { class: 'cmt-text' }, r.text))));
     const actions = h('div', { class: 'cmt-actions' },
       h('button', { class: 'link-btn', onclick: () => openReply() }, icon('comment'), 'Reply'));
@@ -1566,11 +1710,17 @@ async function renderReview(pid, aid) {
         h('button', { class: 'icon-btn sm resolve' + (c.resolved ? ' on' : ''), title: c.resolved ? 'Reopen' : 'Resolve', onclick: () => {
           c.resolved = !c.resolved; c.resolvedAt = c.resolved ? Date.now() : null; Store.save(); renderComments(); renderMarkers();
         } }, icon('check')),
-        h('button', { class: 'icon-btn sm', title: 'More', onclick: (e) => popMenu(e.currentTarget, [
-          { label: 'Edit', icon: 'pen', onclick: edit },
-          { label: 'Delete', danger: true, onclick: () => { if (!confirm('Delete this note?')) return; asset.comments = asset.comments.filter((x) => x.id !== c.id); Store.save(); renderComments(); renderMarkers(); renderInk(); } },
-        ]) }, icon('more'))),
-      h('div', { class: 'cmt-meta' }, h('span', { class: 'author' }, c.author), h('span', { class: 'faint', title: new Date(c.createdAt).toLocaleString() }, ' · ' + timeAgo(c.createdAt) + (c.editedAt ? ' · edited' : ''))),
+        h('button', { class: 'icon-btn sm', title: 'More', onclick: (e) => popMenu(e.currentTarget, c.source === 'client'
+          ? [{ label: 'Hide this client comment', danger: true, onclick: () => {
+            if (!confirm('Hide this comment? It disappears for you and from the client link.')) return;
+            asset.share = asset.share || {}; asset.share.hidden = [...new Set([...(asset.share.hidden || []), c.id])];
+            asset.comments = asset.comments.filter((x) => x.id !== c.id); Store.save(); renderComments(); renderMarkers(); renderInk();
+          } }]
+          : [
+            { label: 'Edit', icon: 'pen', onclick: edit },
+            { label: 'Delete', danger: true, onclick: () => { if (!confirm('Delete this note?')) return; asset.comments = asset.comments.filter((x) => x.id !== c.id); Store.save(); renderComments(); renderMarkers(); renderInk(); } },
+          ]) }, icon('more'))),
+      h('div', { class: 'cmt-meta' }, h('span', { class: 'author' }, c.author), c.source === 'client' ? h('span', { class: 'client-tag' }, 'Client') : null, h('span', { class: 'faint', title: new Date(c.createdAt).toLocaleString() }, ' · ' + timeAgo(c.createdAt) + (c.editedAt ? ' · edited' : ''))),
       textEl, replies, actions);
     el.addEventListener('click', (e) => { if (e.target.closest('button,textarea,input,a')) return; selectComment(c); });
     return el;
@@ -1654,7 +1804,21 @@ async function renderReview(pid, aid) {
   }
   document.addEventListener('keydown', onKey);
 
+  // Keep a shared video's client link in sync: pull client comments now and
+  // every 30 s, and push your own notes a moment after you change them.
+  let syncTimer = null, pushTimer = null;
+  const doSync = async () => {
+    if (!asset.share?.token || asset.share.revoked || !linksReady()) return;
+    const before = asset.comments.length + asset.comments.reduce((n, c) => n + c.replies.length, 0);
+    try { await syncShare(p, asset); } catch (e) { console.warn('Client link sync failed', e); return; }
+    const after = asset.comments.length + asset.comments.reduce((n, c) => n + c.replies.length, 0);
+    if (after !== before && !list.querySelector('textarea:focus')) { renderComments(); renderMarkers(); }
+  };
+  if (asset.share?.token && !asset.share.revoked) { doSync(); syncTimer = setInterval(doSync, 30000); }
+  Store.onSave = () => { if (asset.share?.token && !asset.share.revoked) { clearTimeout(pushTimer); pushTimer = setTimeout(doSync, 1500); } };
+
   cleanupView = () => {
+    clearInterval(syncTimer); clearTimeout(pushTimer); Store.onSave = null;
     document.removeEventListener('keydown', onKey);
     ro.disconnect();
     cancelAnimationFrame(rv.raf);
